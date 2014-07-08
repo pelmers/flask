@@ -4,9 +4,6 @@
     ~~~~~~~~~~~~~
 
     Implements various helpers.
-
-    :copyright: (c) 2014 by Armin Ronacher.
-    :license: BSD, see LICENSE for more details.
 """
 
 import os
@@ -14,11 +11,17 @@ import sys
 import pkgutil
 import posixpath
 import mimetypes
+import contextlib
 from time import time
 from zlib import adler32
 from threading import RLock
 from werkzeug.routing import BuildError
 from functools import update_wrapper
+
+from java.lang import ClassLoader
+from java.io import InputStreamReader, BufferedReader
+from jy import WrapReader
+from zipfile import ZipFile
 
 try:
     from werkzeug.urls import url_quote
@@ -52,6 +55,7 @@ _missing = object()
 _os_alt_seps = list(sep for sep in [os.path.sep, os.path.altsep]
                     if sep not in (None, '/'))
 
+_archive = None
 
 def _endpoint_from_view_func(view_func):
     """Internal helper that returns the default endpoint for a given
@@ -199,16 +203,16 @@ def url_for(endpoint, **values):
     For more information, head over to the :ref:`Quickstart <url-building>`.
 
     To integrate applications, :class:`Flask` has a hook to intercept URL build
-    errors through :attr:`Flask.url_build_error_handlers`.  The `url_for`
-    function results in a :exc:`~werkzeug.routing.BuildError` when the current
-    app does not have a URL for the given endpoint and values.  When it does, the
-    :data:`~flask.current_app` calls its :attr:`~Flask.url_build_error_handlers` if
+    errors through :attr:`Flask.build_error_handler`.  The `url_for` function
+    results in a :exc:`~werkzeug.routing.BuildError` when the current app does
+    not have a URL for the given endpoint and values.  When it does, the
+    :data:`~flask.current_app` calls its :attr:`~Flask.build_error_handler` if
     it is not `None`, which can return a string to use as the result of
     `url_for` (instead of `url_for`'s default to raise the
     :exc:`~werkzeug.routing.BuildError` exception) or re-raise the exception.
     An example::
 
-        def external_url_handler(error, endpoint, values):
+        def external_url_handler(error, endpoint, **values):
             "Looks up an external URL when `url_for` cannot build a URL."
             # This is an example of hooking the build_error_handler.
             # Here, lookup_url is some utility function you've built
@@ -225,10 +229,10 @@ def url_for(endpoint, **values):
             # url_for will use this result, instead of raising BuildError.
             return url
 
-        app.url_build_error_handlers.append(external_url_handler)
+        app.build_error_handler = external_url_handler
 
     Here, `error` is the instance of :exc:`~werkzeug.routing.BuildError`, and
-    `endpoint` and `values` are the arguments passed into `url_for`.  Note
+    `endpoint` and `**values` are the arguments passed into `url_for`.  Note
     that this is for building URLs outside the current application, and not for
     handling 404 NotFound errors.
 
@@ -359,7 +363,7 @@ def flash(message, category='message'):
     #     session.setdefault('_flashes', []).append((category, message))
     #
     # This assumed that changes made to mutable structures in the session are
-    # are always in sync with the session object, which is not true for session
+    # are always in sync with the sess on object, which is not true for session
     # implementations that use external storage for keeping their keys/values.
     flashes = session.get('_flashes', [])
     flashes.append((category, message))
@@ -467,6 +471,9 @@ def send_file(filename_or_fp, mimetype=None, as_attachment=False,
                           :meth:`~Flask.get_send_file_max_age` of
                           :data:`~flask.current_app`.
     """
+    global _archive
+    if _archive is None:
+        _archive = ZipFile(os.path.join(current_app.root_path, "hjviz.jar"))
     mtime = None
     if isinstance(filename_or_fp, string_types):
         filename = filename_or_fp
@@ -490,10 +497,11 @@ def send_file(filename_or_fp, mimetype=None, as_attachment=False,
                 'function because this behavior was unreliable.  Pass '
                 'filenames instead if possible, otherwise attach an etag '
                 'yourself based on another value'), stacklevel=2)
+    old_filename = os.path.join("static",str(filename)) if not str(filename).startswith("static") else str(filename)
 
     if filename is not None:
         if not os.path.isabs(filename):
-            filename = os.path.join(current_app.root_path, filename)
+            filename = os.path.join(current_app.root_path, old_filename)
     if mimetype is None and (filename or attachment_filename):
         mimetype = mimetypes.guess_type(filename or attachment_filename)[0]
     if mimetype is None:
@@ -512,14 +520,18 @@ def send_file(filename_or_fp, mimetype=None, as_attachment=False,
     if current_app.use_x_sendfile and filename:
         if file is not None:
             file.close()
-        headers['X-Sendfile'] = filename
         headers['Content-Length'] = os.path.getsize(filename)
+        headers['X-Sendfile'] = filename
         data = None
     else:
         if file is None:
-            file = open(filename, 'rb')
-            mtime = os.path.getmtime(filename)
-            headers['Content-Length'] = os.path.getsize(filename)
+            try:
+                info = _archive.getinfo(old_filename)
+                file = _archive.open(old_filename, 'r')
+                headers['Content-Length'] = info.file_size
+            except KeyError:
+                file = open(filename, 'rb')
+                headers['Content-Length'] = os.path.getsize(filename)
         data = wrap_file(request.environ, file)
 
     rv = current_app.response_class(data, mimetype=mimetype, headers=headers,
@@ -538,19 +550,13 @@ def send_file(filename_or_fp, mimetype=None, as_attachment=False,
         rv.expires = int(time() + cache_timeout)
 
     if add_etags and filename is not None:
-        try:
-            rv.set_etag('flask-%s-%s-%s' % (
-                os.path.getmtime(filename),
-                os.path.getsize(filename),
-                adler32(
-                    filename.encode('utf-8') if isinstance(filename, text_type)
-                    else filename
-                ) & 0xffffffff
-            ))
-        except OSError:
-            warn('Access %s failed, maybe it does not exist, so ignore etags in '
-                 'headers' % filename, stacklevel=2)
-
+        rv.set_etag('flask-%s-%s' % (
+            headers['Content-Length'],
+            adler32(
+                filename.encode('utf-8') if isinstance(filename, text_type)
+                else filename
+            ) & 0xffffffff
+        ))
         if conditional:
             rv = rv.make_conditional(request)
             # make sure we don't send x-sendfile for servers that
@@ -614,12 +620,6 @@ def send_from_directory(directory, filename, **options):
     :param options: optional keyword arguments that are directly
                     forwarded to :func:`send_file`.
     """
-    filename = safe_join(directory, filename)
-    if not os.path.isabs(filename):
-        filename = os.path.join(current_app.root_path, filename)
-    if not os.path.isfile(filename):
-        raise NotFound()
-    options.setdefault('conditional', True)
     return send_file(filename, **options)
 
 
@@ -635,7 +635,10 @@ def get_root_path(import_name):
         return os.path.dirname(os.path.abspath(mod.__file__))
 
     # Next attempt: check the loader.
-    loader = pkgutil.get_loader(import_name)
+    try:
+        loader = pkgutil.get_loader(import_name)
+    except ImportError:
+        loader = None
 
     # Loader does not exist or we're referring to an unloaded main module
     # or a main module without path (interactive sessions), go with the
@@ -650,46 +653,10 @@ def get_root_path(import_name):
     else:
         # Fall back to imports.
         __import__(import_name)
-        mod = sys.modules[import_name]
-        filepath = getattr(mod, '__file__', None)
-
-        # If we don't have a filepath it might be because we are a
-        # namespace package.  In this case we pick the root path from the
-        # first module that is contained in our package.
-        if filepath is None:
-            raise RuntimeError('No root path can be found for the provided '
-                               'module "%s".  This can happen because the '
-                               'module came from an import hook that does '
-                               'not provide file name information or because '
-                               'it\'s a namespace package.  In this case '
-                               'the root path needs to be explicitly '
-                               'provided.' % import_name)
+        filepath = sys.modules[import_name].__file__
 
     # filepath is import_name.py for a module, or __init__.py for a package.
     return os.path.dirname(os.path.abspath(filepath))
-
-
-def _matching_loader_thinks_module_is_package(loader, mod_name):
-    """Given the loader that loaded a module and the module this function
-    attempts to figure out if the given module is actually a package.
-    """
-    # If the loader can tell us if something is a package, we can
-    # directly ask the loader.
-    if hasattr(loader, 'is_package'):
-        return loader.is_package(mod_name)
-    # importlib's namespace loaders do not have this functionality but
-    # all the modules it loads are packages, so we can take advantage of
-    # this information.
-    elif (loader.__class__.__module__ == '_frozen_importlib' and
-          loader.__class__.__name__ == 'NamespaceLoader'):
-        return True
-    # Otherwise we need to fail with an error that explains what went
-    # wrong.
-    raise AttributeError(
-        ('%s.is_package() method is missing but is required by Flask of '
-         'PEP 302 import hooks.  If you do not use import hooks and '
-         'you encounter this error please file a bug against Flask.') %
-        loader.__class__.__name__)
 
 
 def find_package(import_name):
@@ -721,12 +688,8 @@ def find_package(import_name):
             __import__(import_name)
             filename = sys.modules[import_name].__file__
         package_path = os.path.abspath(os.path.dirname(filename))
-
-        # In case the root module is a pcakage we need to chop of the
-        # rightmost part.  This needs to go through a helper function
-        # because of python 3.3 namespace packages.
-        if _matching_loader_thinks_module_is_package(
-                loader, root_mod_name):
+        # package_path ends with __init__.py for a package
+        if loader.is_package(root_mod_name):
             package_path = os.path.dirname(package_path)
 
     site_parent, site_folder = os.path.split(package_path)
@@ -784,11 +747,8 @@ class _PackageBoundObject(object):
         #: exposed.
         self.template_folder = template_folder
 
-        if root_path is None:
-            root_path = get_root_path(self.import_name)
-
         #: Where is the app root located?
-        self.root_path = root_path
+        self.root_path = get_root_path(self.import_name) if not root_path else root_path
 
         self._static_folder = None
         self._static_url_path = None
@@ -863,14 +823,13 @@ class _PackageBoundObject(object):
 
         .. versionadded:: 0.5
         """
-        if not self.has_static_folder:
-            raise RuntimeError('No static folder for this object')
         # Ensure get_send_file_max_age is called in all cases.
         # Here, we ensure get_send_file_max_age is called for Blueprints.
         cache_timeout = self.get_send_file_max_age(filename)
         return send_from_directory(self.static_folder, filename,
                                    cache_timeout=cache_timeout)
 
+    @contextlib.contextmanager
     def open_resource(self, resource, mode='rb'):
         """Opens a resource from the application's resource folder.  To see
         how this works, consider the following folder structure::
@@ -896,4 +855,8 @@ class _PackageBoundObject(object):
         """
         if mode not in ('r', 'rb'):
             raise ValueError('Resources can only be opened for reading')
-        return open(os.path.join(self.root_path, resource), mode)
+        loader = ClassLoader.getSystemClassLoader()
+        stream = loader.getResourceAsStream(resource)
+        reader = BufferedReader(InputStreamReader(stream))
+        yield WrapReader(reader)
+        reader.close()

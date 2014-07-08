@@ -11,7 +11,6 @@
 
 import os
 import sys
-import click
 from threading import Lock
 from datetime import timedelta
 from itertools import chain
@@ -538,14 +537,6 @@ class Flask(_PackageBoundObject):
                               endpoint='static',
                               view_func=self.send_static_file)
 
-        #: The click command line context for this application.  Commands
-        #: registered here show up in the ``flask`` command once the
-        #: application has been discovered.  The default commands are
-        #: provided by Flask itself and can be overridden.
-        #:
-        #: This is an instance of a :class:`click.Group` object.
-        self.cli = click.Group(self)
-
     def _get_error_handlers(self):
         from warnings import warn
         warn(DeprecationWarning('error_handlers is deprecated, use the '
@@ -816,6 +807,7 @@ class Flask(_PackageBoundObject):
                         :func:`werkzeug.serving.run_simple` for more
                         information.
         """
+        debug = False
         from werkzeug.serving import run_simple
         if host is None:
             host = '127.0.0.1'
