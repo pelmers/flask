@@ -20,7 +20,6 @@ from functools import update_wrapper
 
 from java.lang import ClassLoader
 from java.io import InputStreamReader, BufferedReader
-from jy import WrapReader
 from zipfile import ZipFile
 
 try:
@@ -33,7 +32,7 @@ from werkzeug.exceptions import NotFound
 
 # this was moved in 0.7
 try:
-    from werkzeug.wsgi import wrap_file
+    from werkzeug.wsgi import wrap_file, wrap_reader
 except ImportError:
     from werkzeug.utils import wrap_file
 
@@ -54,8 +53,6 @@ _missing = object()
 # able to access files from outside the filesystem.
 _os_alt_seps = list(sep for sep in [os.path.sep, os.path.altsep]
                     if sep not in (None, '/'))
-
-_archive = None
 
 def _endpoint_from_view_func(view_func):
     """Internal helper that returns the default endpoint for a given
@@ -471,9 +468,6 @@ def send_file(filename_or_fp, mimetype=None, as_attachment=False,
                           :meth:`~Flask.get_send_file_max_age` of
                           :data:`~flask.current_app`.
     """
-    global _archive
-    if _archive is None:
-        _archive = ZipFile(os.path.join(current_app.root_path, "hjviz.jar"))
     mtime = None
     if isinstance(filename_or_fp, string_types):
         filename = filename_or_fp
@@ -517,6 +511,7 @@ def send_file(filename_or_fp, mimetype=None, as_attachment=False,
         headers.add('Content-Disposition', 'attachment',
                     filename=attachment_filename)
 
+    skip = False
     if current_app.use_x_sendfile and filename:
         if file is not None:
             file.close()
@@ -525,13 +520,19 @@ def send_file(filename_or_fp, mimetype=None, as_attachment=False,
         data = None
     else:
         if file is None:
-            try:
-                info = _archive.getinfo(old_filename)
-                file = _archive.open(old_filename, 'r')
-                headers['Content-Length'] = info.file_size
-            except KeyError:
+            # first try to open it from the jar archive
+            loader = ClassLoader.getSystemClassLoader()
+            uri = loader.getResource(old_filename)
+            if uri:
+                stream = loader.getResourceAsStream(old_filename)
+                reader = BufferedReader(InputStreamReader(stream))
+                data = wrap_reader(reader)
+                headers['Content-Length'] = len(data)
+                skip = True
+            else:
                 file = open(filename, 'rb')
                 headers['Content-Length'] = os.path.getsize(filename)
+    if not skip:
         data = wrap_file(request.environ, file)
 
     rv = current_app.response_class(data, mimetype=mimetype, headers=headers,
@@ -858,5 +859,5 @@ class _PackageBoundObject(object):
         loader = ClassLoader.getSystemClassLoader()
         stream = loader.getResourceAsStream(resource)
         reader = BufferedReader(InputStreamReader(stream))
-        yield WrapReader(reader)
+        yield wrap_reader(reader)
         reader.close()
